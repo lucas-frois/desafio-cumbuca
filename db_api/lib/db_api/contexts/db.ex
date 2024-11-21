@@ -1,139 +1,109 @@
 defmodule DbApi.Db do
 
   def run_command(command, client_name) do
+    with {:ok, [db_path, transactions_list_path, transactions_data_path]} <- ensure_database_files_created(),
+         {:ok, [validated_command, key, value]} <- validate_command(command) do
 
-    case ensure_files_created() do
-      {:error} -> {:error, "ERR - file permissions"}
-      {:ok, [db_fullpath, transactions_list_fullpath, transactions_data_fullpath]} ->
-        case validate_commands(command) do
-          {:error, reason} -> {:error, reason}
-          {:ok, [command, key, value]} ->
-            paths = [db_fullpath, transactions_list_fullpath, transactions_data_fullpath]
+      file_paths = [db_path, transactions_list_path, transactions_data_path]
 
-            case command do
-              "get" -> handleGet(key, client_name, paths)
-              "set" -> handleSet(key, value, client_name, paths)
-              "begin" -> handle_begin(client_name, paths)
-              "commit" -> handleCommit(client_name, paths)
-              "rollback" -> handleRollback(client_name, paths)
-              _ -> {:error, "No command match."} # will never happen
-            end
-        end
+      case validated_command do
+        "get" -> fetch_record(key, client_name, file_paths)
+        "set" -> create_or_update_record(key, value, client_name, file_paths)
+        "begin" -> start_transaction(client_name, file_paths)
+        "commit" -> commit_transaction(client_name, file_paths)
+        "rollback" -> revert_transaction(client_name, file_paths)
+        _ -> {:error, "Invalid command."}
+      end
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
 
-  # banco
-  # será armazenado os registros na forma de key;value
-  # se alguma key ou value tiver ;, vai quebrar
-  # eh o melhor que consigo fazer agora
+  defp fetch_record(key, client_name, [db_path, transactions_list_path, transactions_data_path]) do
+    file_to_read = if has_open_transaction?(transactions_list_path, client_name),
+                    do: transactions_data_path,
+                    else: db_path
 
-  # get
-  # verifica se tem transacao aberta pro client_name
-  # se sim, le do banco temporário
-  # se nao, le do banco real
-  defp handleGet(key, client_name, paths) do
-    [db_fullpath, transactions_list_fullpath, transactions_data_fullpath] = paths
+    lines = read_file(file_to_read)
 
-    has_open_transaction = has_open_transaction(transactions_list_fullpath, client_name)
+    case find_record_by_key(lines, key) do
+      nil ->
+        {:error, "Record not found"}
 
-    lines = cond do
-      has_open_transaction -> read_file(transactions_data_fullpath)
-      true -> read_file(db_fullpath)
-    end
-
-    match_function = fn (x) -> String.starts_with?(x, "#{key};") end
-
-    record = Enum.find(lines, nil, match_function)
-
-    case record do
-      nil -> {:error, nil}
-      _ ->
-        [_, value] = String.split(record, ";") |> List.last()
-        {:ok, value}
+      record ->
+        {:ok, extract_value_from_record(record)}
     end
   end
 
-  # set (upsert)
-  # verifica se tem transacao aberta pro client_name;
-  # se sim, escreve no banco temporario; se nao, escreve no banco real
-  # - upsert => cria ou atualiza; se atualiza, retorna valor antigo; se cria, retorna nil
-  defp handleSet(key, value, client_name, paths) do
-    [db_fullpath, transactions_list_fullpath, transactions_data_fullpath] = paths
+  defp find_record_by_key(lines, key) do
+    Enum.find(lines, fn line ->
+      String.starts_with?(line, "#{key};")
+    end)
+  end
 
-    has_open_transaction = has_open_transaction(transactions_list_fullpath, client_name)
+  defp extract_value_from_record(record) do
+    record
+    |> String.split(";")
+    |> List.last()
+  end
 
-    desired_db_path = cond do
-      has_open_transaction = transactions_data_fullpath
-      true = db_fullpath
-    end
+  defp create_or_update_record(key, value, client_name, [db_path, transactions_list_path, transactions_data_path]) do
+    target_file_path = if has_open_transaction?(transactions_list_path, client_name),
+                       do: transactions_data_path,
+                       else: db_path
 
-    lines = read_file(desired_db_path)
+    lines = read_file(target_file_path)
 
-    match_function = fn (x) -> String.starts_with?(x, "#{key};") end
-
-    record = Enum.find(lines, nil, match_function)
-
-    doesRecordExists = record === nil
-
-    case doesRecordExists do
-      false ->
-        content = ["#{key};#{value}" | lines]
-        write_file(desired_db_path, content)
+    case find_record_by_key(lines, key) do
+      nil ->
+        new_lines = ["#{key};#{value}" | lines]
+        write_file(target_file_path, new_lines)
         {:ok, "#{nil} #{value}"}
-      true ->
-        [_, previous_value] = String.split(record, ";") |> List.last()
-        updated_lines = lines
-          |> Enum.map(fn item ->
-            [xkey, xvalue] = String.split(item, ";")
-            if xkey == key, do: "#{key};#{value}", else: item
-          end)
-          write_file(desired_db_path, updated_lines)
+
+      existing_record ->
+        previous_value = extract_value_from_record(existing_record)
+
+        updated_lines = Enum.map(lines, fn line ->
+          if String.starts_with?(line, "#{key};"), do: "#{key};#{value}", else: line
+        end)
+
+        write_file(target_file_path, updated_lines)
         {:ok, "#{previous_value} #{value}"}
     end
   end
 
   defp read_file(path) do
-    lines = path
+    path
     |> File.read!()
     |> String.split("\n")
-
-    lines
+    |> Enum.reject(&String.trim/1 == "")
   end
 
   defp write_file(path, content) do
-    lines = Enum.join(content, "\n") # content is a list
-
-    File.write(path, lines, [:write])
+    content
+    |> Enum.join("\n")
+    |> then(&File.write(path, &1, [:write]))
   end
 
-  defp has_open_transaction(file_path, client_name) do
-    lines = read_file(file_path)
-
-    Enum.member?(lines, client_name)
+  defp has_open_transaction?(path, client_name) do
+    path
+    |> read_file()
+    |> Enum.any?(fn line -> line == client_name end)
   end
 
   defp create_transaction(file_path, client_name) do
-    lines = read_file(file_path)
-
-    updatedLines = [client_name | lines]
-
-    write_file(file_path, updatedLines)
+    file_path
+    |> read_file()
+    |> then(fn lines -> [client_name | lines] end)
+    |> then(&write_file(file_path, &1))
   end
 
-  # begin
-  # verifica se já existe uma transacao
-  # se sim, retorna erro;
-  # se nao, cria um registro nos arquivo de listas de transacoes e retorna :ok
-  defp handle_begin(client_name, paths) do
-    [db_fullpath, transactions_list_fullpath, transactions_data_fullpath] = paths
-
-    has_open_transaction = has_open_transaction(transactions_list_fullpath, client_name)
-
-    case has_open_transaction do
-      true -> {:error, "ERR - transaction has already been started."}
-      false ->
-        create_transaction(transactions_list_fullpath, client_name)
-        {:ok, "OK"}
+  defp start_transaction(client_name, [_db_path, transactions_list_path, _transactions_data_path]) do
+    if has_open_transaction?(transactions_list_path, client_name) do
+      {:error, "Transaction already in progress"}
+    else
+      create_transaction(transactions_list_path, client_name)
+      {:ok, "Transaction started"}
     end
   end
 
@@ -145,7 +115,7 @@ defmodule DbApi.Db do
   # o valor das chaves modificadas dentro da transacao
   # nao pode ter sido alterado fora da transacao
 
-  defp handleCommit(client_name, paths) do
+  defp commit_transaction(client_name, paths) do
     [db_fullpath, transactions_list_fullpath, transactions_data_fullpath] = paths
 
     has_open_transaction = has_open_transaction(transactions_list_fullpath, client_name)
@@ -189,49 +159,48 @@ defmodule DbApi.Db do
   # rollback
   # verifica se existe uma transacao acontecendo; se nao, retorna erro
   # se sim, apaga os registros correspondentes nos dois arquivos de transacao
-  defp handleRollback(client_name, paths) do
-    [db_fullpath, transactions_list_fullpath, transactions_data_fullpath] = paths
+  defp revert_transaction(client_name, [db_path, transactions_list_path, transactions_data_path]) do
 
-    has_open_transaction = has_open_transaction(transactions_list_fullpath, client_name)
+    if has_open_transaction(transactions_list_path, client_name) do
+      {:error, "ERR - cannot rollback with transaction level equals to zero"}
+    else
+      transaction_db_records = read_file(transactions_data_path)
 
-    case has_open_transaction do
-      true -> {:error, "ERR - cannot rollback with transaction level equals to zero"}
-      false ->
-        transcation_db_records = read_file(transactions_data_fullpath)
+      updated_lines = Enum.filter(transaction_db_records, fn record ->
+        String.split(record, ";") |> List.first() != client_name
+      end)
 
-        updated_lines = transcation_db_records
-          |> Enum.filter(fn record ->
-            String.split(record, ";") |> List.first() != client_name
-          end)
-          write_file(transactions_data_fullpath, updated_lines)
+      write_file(transactions_data_path, updated_lines)
 
-          updated_transactions_list = read_file(transactions_list_fullpath)
-            |> Enum.filter(fn client ->
-              client != client_names
-            end)
+      transactions_list = read_file(transactions_list_path)
 
-          write_file(transactions_list_fullpath, updated_transactions_list)
-        {:ok, "OK"}
+      updated_transactions_list = transactions_list
+      |> Enum.filter(fn client -> client != client_name end)
+
+      write_file(transactions_list_path, updated_transactions_list)
+
+      {:ok, "OK"}
     end
   end
 
-  defp ensure_files_created() do
-    db_filename = "db.txt"
-    transactions_list_filename = "transactions-list.txt"
-    transactions_data_filename = "transactions-data.txt"
+  defp ensure_database_files_created do
     storage_path = Path.join([System.user_home!(), "CumbucaDb", "storage"])
 
-    db_fullpath = Path.join(storage_path, db_filename)
-    transactions_list_fullpath = Path.join(storage_path, transactions_list_filename)
-    transactions_data_fullpath = Path.join(storage_path, transactions_data_filename)
+    files = [
+      db_filename: "db.txt",
+      transactions_list_filename: "transactions-list.txt",
+      transactions_data_filename: "transactions-data.txt"
+    ]
 
-    :ok = File.mkdir_p!(storage_path)
+    File.mkdir_p!(storage_path)
 
-    ensure_file_created(db_fullpath)
-    ensure_file_created(transactions_list_fullpath)
-    ensure_file_created(transactions_data_fullpath)
+    paths = Enum.map(files, fn {_name, filename} ->
+      full_path = Path.join(storage_path, filename)
+      ensure_file_created(full_path)
+      full_path
+    end)
 
-    {:ok, [db_fullpath, transactions_list_fullpath, transactions_data_fullpath]}
+    {:ok, paths}
   end
 
   defp ensure_file_created(file_path) do
